@@ -1,0 +1,12 @@
+LICENSE
+README.md
+setup.py
+monotonic_align/__init__.py
+monotonic_align/setup.py
+text/__init__.py
+text/cleaners.py
+text/symbols.py
+vits.egg-info/PKG-INFO
+vits.egg-info/SOURCES.txt
+vits.egg-info/dependency_links.txt
+vits.egg-info/top_level.txt

@@ -45,13 +45,26 @@ def rand_gumbel_like(x):
   return g
 
 
+
 def slice_segments(x, ids_str, segment_size=4):
-  ret = torch.zeros_like(x[:, :, :segment_size])
-  for i in range(x.size(0)):
-    idx_str = ids_str[i]
-    idx_end = idx_str + segment_size
-    ret[i] = x[i, :, idx_str:idx_end]
-  return ret
+    """
+    x:     (B, C, T) tensor of features
+    ids_str: (B,) tensor of start‐indices
+    segment_size: length of each slice to extract
+
+    Returns: (B, C, segment_size) zero‑padded slices
+    """
+    B, C, T = x.size()
+    # explicitly allocate exactly the right shape
+    ret = torch.zeros((B, C, segment_size), device=x.device, dtype=x.dtype)
+
+    for i in range(B):
+        start = ids_str[i].item()  # ensure Python int
+        end   = start + segment_size
+        # grab whatever frames are available
+        seg = x[i, :, start:end]        # shape (C, <=segment_size)
+        ret[i, :, :seg.size(1)] = seg   # copy into start of ret[i]
+    return ret
 
 
 def rand_slice_segments(x, x_lengths=None, segment_size=4):

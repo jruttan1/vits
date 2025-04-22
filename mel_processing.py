@@ -49,23 +49,33 @@ hann_window = {}
 
 
 def spectrogram_torch(y, n_fft, sampling_rate, hop_size, win_size, center=False):
-    if torch.min(y) < -1.:
-        print('min value is ', torch.min(y))
-    if torch.max(y) > 1.:
-        print('max value is ', torch.max(y))
+    # collapse any channel dimension (e.g. stereo → mono)
+    if y.dim() == 3 and y.size(2) > 1:
+        y = y.mean(dim=2)
+    elif y.dim() == 2 and y.size(1) > 1:
+        y = y.mean(dim=1)
+    
+    # ensure [batch, time]
+    if y.dim() == 1:
+        y = y.unsqueeze(0)
+    # pad along time axis only
+    pad_amount = (n_fft - hop_size) // 2
+    y = F.pad(y, (pad_amount, pad_amount), mode='constant', value=0)
 
-    global hann_window
-    dtype_device = str(y.dtype) + '_' + str(y.device)
-    wnsize_dtype_device = str(win_size) + '_' + dtype_device
-    if wnsize_dtype_device not in hann_window:
-        hann_window[wnsize_dtype_device] = torch.hann_window(win_size).to(dtype=y.dtype, device=y.device)
-
-    y = torch.nn.functional.pad(y.unsqueeze(1), (int((n_fft-hop_size)/2), int((n_fft-hop_size)/2)), mode='reflect')
-    y = y.squeeze(1)
-
-    spec = torch.stft(y, n_fft, hop_length=hop_size, win_length=win_size, window=hann_window[wnsize_dtype_device],
-                      center=center, pad_mode='reflect', normalized=False, onesided=True)
-
+    # compute STFT
+    spec = torch.stft(
+        y,
+        n_fft,
+        hop_length=hop_size,
+        win_length=win_size,
+        window=hann_window.setdefault(f"{win_size}_{y.dtype}_{y.device}",
+                                      torch.hann_window(win_size, dtype=y.dtype, device=y.device)),
+        center=center,
+        pad_mode='reflect',
+        normalized=False,
+        return_complex=False,
+        onesided=True
+    )
     spec = torch.sqrt(spec.pow(2).sum(-1) + 1e-6)
     return spec
 
@@ -75,7 +85,7 @@ def spec_to_mel_torch(spec, n_fft, num_mels, sampling_rate, fmin, fmax):
     dtype_device = str(spec.dtype) + '_' + str(spec.device)
     fmax_dtype_device = str(fmax) + '_' + dtype_device
     if fmax_dtype_device not in mel_basis:
-        mel = librosa_mel_fn(sampling_rate, n_fft, num_mels, fmin, fmax)
+        mel = librosa_mel_fn(sr=sampling_rate, n_fft=n_fft, n_mels=num_mels, fmin=fmin, fmax=fmax)
         mel_basis[fmax_dtype_device] = torch.from_numpy(mel).to(dtype=spec.dtype, device=spec.device)
     spec = torch.matmul(mel_basis[fmax_dtype_device], spec)
     spec = spectral_normalize_torch(spec)
@@ -83,30 +93,46 @@ def spec_to_mel_torch(spec, n_fft, num_mels, sampling_rate, fmin, fmax):
 
 
 def mel_spectrogram_torch(y, n_fft, num_mels, sampling_rate, hop_size, win_size, fmin, fmax, center=False):
-    if torch.min(y) < -1.:
-        print('min value is ', torch.min(y))
-    if torch.max(y) > 1.:
-        print('max value is ', torch.max(y))
+    # collapse any channel dimension
+    if y.dim() == 3 and y.size(2) > 1:
+        y = y.mean(dim=2)
+    elif y.dim() == 2 and y.size(1) > 1:
+        y = y.mean(dim=1)
+    
+    # ensure [batch, time]
+    if y.dim() == 1:
+        y = y.unsqueeze(0)
+    
+    # ensure signal is at least n_fft long (required by torch.stft)
+    length = y.size(-1)
+    if length < n_fft:
+        y = F.pad(y, (0, n_fft - length), mode='constant', value=0)
 
-    global mel_basis, hann_window
-    dtype_device = str(y.dtype) + '_' + str(y.device)
-    fmax_dtype_device = str(fmax) + '_' + dtype_device
-    wnsize_dtype_device = str(win_size) + '_' + dtype_device
-    if fmax_dtype_device not in mel_basis:
-        mel = librosa_mel_fn(sampling_rate, n_fft, num_mels, fmin, fmax)
-        mel_basis[fmax_dtype_device] = torch.from_numpy(mel).to(dtype=y.dtype, device=y.device)
-    if wnsize_dtype_device not in hann_window:
-        hann_window[wnsize_dtype_device] = torch.hann_window(win_size).to(dtype=y.dtype, device=y.device)
-
-    y = torch.nn.functional.pad(y.unsqueeze(1), (int((n_fft-hop_size)/2), int((n_fft-hop_size)/2)), mode='reflect')
-    y = y.squeeze(1)
-
-    spec = torch.stft(y, n_fft, hop_length=hop_size, win_length=win_size, window=hann_window[wnsize_dtype_device],
-                      center=center, pad_mode='reflect', normalized=False, onesided=True)
-
+    # center‐pad for STFT windowing
+    pad_amount = (n_fft - hop_size) // 2
+    y = F.pad(y, (pad_amount, pad_amount), mode='constant', value=0)
+    
+    # compute STFT
+    spec = torch.stft(
+        y,
+        n_fft,
+        hop_length=hop_size,
+        win_length=win_size,
+        window=hann_window.setdefault(f"{win_size}_{y.dtype}_{y.device}",
+                                      torch.hann_window(win_size, dtype=y.dtype, device=y.device)),
+        center=center,
+        pad_mode='reflect',
+        normalized=False,
+        return_complex=False,
+        onesided=True
+    )
     spec = torch.sqrt(spec.pow(2).sum(-1) + 1e-6)
-
-    spec = torch.matmul(mel_basis[fmax_dtype_device], spec)
-    spec = spectral_normalize_torch(spec)
-
-    return spec
+    
+    # apply Mel filterbank
+    key = f"{fmax}_{spec.dtype}_{spec.device}"
+    if key not in mel_basis:
+        m = librosa_mel_fn(sr=sampling_rate, n_fft=n_fft, n_mels=num_mels, fmin=fmin, fmax=fmax)
+        mel_basis[key] = torch.from_numpy(m).to(dtype=spec.dtype, device=spec.device)
+    spec = torch.matmul(mel_basis[key], spec)
+    
+    return spectral_normalize_torch(spec)

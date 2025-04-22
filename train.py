@@ -33,25 +33,38 @@ from losses import (
 from mel_processing import mel_spectrogram_torch, spec_to_mel_torch
 from text.symbols import symbols
 
+'''
+export PYTHONPATH=$PWD:$PYTHONPATH
+python3 train.py -c my_configs/comanche_vits.json -m comanche_vits
+'''
+'''
+cd /Users/jack/Desktop/VITS2/vits
+rm -rf ./logs/comanche_vits
+'''
+
 
 torch.backends.cudnn.benchmark = True
 global_step = 0
 
 
 def main():
-  """Assume Single Node Multi GPUs Training Only"""
-  assert torch.cuda.is_available(), "CPU training is not allowed."
+  hps = utils.get_hparams()
+  if not torch.cuda.is_available():
+      print("Warning: GPU not available. Running on CPU.")
+      run(rank=0, n_gpus=1, hps=hps)
+      return
 
   n_gpus = torch.cuda.device_count()
   os.environ['MASTER_ADDR'] = 'localhost'
   os.environ['MASTER_PORT'] = '80000'
-
-  hps = utils.get_hparams()
   mp.spawn(run, nprocs=n_gpus, args=(n_gpus, hps,))
 
 
 def run(rank, n_gpus, hps):
   global global_step
+  use_cuda = torch.cuda.is_available()
+  device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
   if rank == 0:
     logger = utils.get_logger(hps.model_dir)
     logger.info(hps)
@@ -59,9 +72,11 @@ def run(rank, n_gpus, hps):
     writer = SummaryWriter(log_dir=hps.model_dir)
     writer_eval = SummaryWriter(log_dir=os.path.join(hps.model_dir, "eval"))
 
-  dist.init_process_group(backend='nccl', init_method='env://', world_size=n_gpus, rank=rank)
-  torch.manual_seed(hps.train.seed)
-  torch.cuda.set_device(rank)
+  if use_cuda:
+      dist.init_process_group(backend='nccl', init_method='env://', world_size=n_gpus, rank=rank)
+      torch.cuda.set_device(rank)
+  else:
+      torch.manual_seed(hps.train.seed)
 
   train_dataset = TextAudioLoader(hps.data.training_files, hps.data)
   train_sampler = DistributedBucketSampler(
@@ -72,11 +87,11 @@ def run(rank, n_gpus, hps):
       rank=rank,
       shuffle=True)
   collate_fn = TextAudioCollate()
-  train_loader = DataLoader(train_dataset, num_workers=8, shuffle=False, pin_memory=True,
+  train_loader = DataLoader(train_dataset, num_workers=0, shuffle=False, pin_memory=True,
       collate_fn=collate_fn, batch_sampler=train_sampler)
   if rank == 0:
     eval_dataset = TextAudioLoader(hps.data.validation_files, hps.data)
-    eval_loader = DataLoader(eval_dataset, num_workers=8, shuffle=False,
+    eval_loader = DataLoader(eval_dataset, num_workers=0, shuffle=False,
         batch_size=hps.train.batch_size, pin_memory=True,
         drop_last=False, collate_fn=collate_fn)
 
@@ -84,8 +99,8 @@ def run(rank, n_gpus, hps):
       len(symbols),
       hps.data.filter_length // 2 + 1,
       hps.train.segment_size // hps.data.hop_length,
-      **hps.model).cuda(rank)
-  net_d = MultiPeriodDiscriminator(hps.model.use_spectral_norm).cuda(rank)
+      **hps.model).to(device=device)
+  net_d = MultiPeriodDiscriminator(hps.model.use_spectral_norm).to(device=device)
   optim_g = torch.optim.AdamW(
       net_g.parameters(), 
       hps.train.learning_rate, 
@@ -96,8 +111,9 @@ def run(rank, n_gpus, hps):
       hps.train.learning_rate, 
       betas=hps.train.betas, 
       eps=hps.train.eps)
-  net_g = DDP(net_g, device_ids=[rank])
-  net_d = DDP(net_d, device_ids=[rank])
+  if use_cuda:
+      net_g = DDP(net_g, device_ids=[rank])
+      net_d = DDP(net_d, device_ids=[rank])
 
   try:
     _, _, _, epoch_str = utils.load_checkpoint(utils.latest_checkpoint_path(hps.model_dir, "G_*.pth"), net_g, optim_g)
@@ -123,6 +139,8 @@ def run(rank, n_gpus, hps):
 
 def train_and_evaluate(rank, epoch, hps, nets, optims, schedulers, scaler, loaders, logger, writers):
   net_g, net_d = nets
+  # determine device from the generator model
+  dev = next(net_g.parameters()).device
   optim_g, optim_d = optims
   scheduler_g, scheduler_d = schedulers
   train_loader, eval_loader = loaders
@@ -135,9 +153,9 @@ def train_and_evaluate(rank, epoch, hps, nets, optims, schedulers, scaler, loade
   net_g.train()
   net_d.train()
   for batch_idx, (x, x_lengths, spec, spec_lengths, y, y_lengths) in enumerate(train_loader):
-    x, x_lengths = x.cuda(rank, non_blocking=True), x_lengths.cuda(rank, non_blocking=True)
-    spec, spec_lengths = spec.cuda(rank, non_blocking=True), spec_lengths.cuda(rank, non_blocking=True)
-    y, y_lengths = y.cuda(rank, non_blocking=True), y_lengths.cuda(rank, non_blocking=True)
+    x, x_lengths = x.to(device=dev, non_blocking=True), x_lengths.to(device=dev, non_blocking=True)
+    spec, spec_lengths = spec.to(device=dev, non_blocking=True), spec_lengths.to(device=dev, non_blocking=True)
+    y, y_lengths = y.to(device=dev, non_blocking=True), y_lengths.to(device=dev, non_blocking=True)
 
     with autocast(enabled=hps.train.fp16_run):
       y_hat, l_length, attn, ids_slice, x_mask, z_mask,\
@@ -177,6 +195,10 @@ def train_and_evaluate(rank, epoch, hps, nets, optims, schedulers, scaler, loade
 
     with autocast(enabled=hps.train.fp16_run):
       # Generator
+      print("y_mel shape:", y_mel.shape)
+      print("y_hat_mel shape:", y_hat_mel.shape)
+      if y_mel.shape[2] != y_hat_mel.shape[2]:
+        y_mel = F.interpolate(y_mel, size=y_hat_mel.shape[2], mode='nearest')
       y_d_hat_r, y_d_hat_g, fmap_r, fmap_g = net_d(y, y_hat)
       with autocast(enabled=False):
         loss_dur = torch.sum(l_length.float())
@@ -232,13 +254,14 @@ def train_and_evaluate(rank, epoch, hps, nets, optims, schedulers, scaler, loade
  
 def evaluate(hps, generator, eval_loader, writer_eval):
     generator.eval()
+    # determine device from model parameters
+    dev = next(generator.parameters()).device
     with torch.no_grad():
       for batch_idx, (x, x_lengths, spec, spec_lengths, y, y_lengths) in enumerate(eval_loader):
-        x, x_lengths = x.cuda(0), x_lengths.cuda(0)
-        spec, spec_lengths = spec.cuda(0), spec_lengths.cuda(0)
-        y, y_lengths = y.cuda(0), y_lengths.cuda(0)
+        x, x_lengths = x.to(device=dev), x_lengths.to(device=dev)
+        spec, spec_lengths = spec.to(device=dev), spec_lengths.to(device=dev)
+        y, y_lengths = y.to(device=dev), y_lengths.to(device=dev)
 
-        # remove else
         x = x[:1]
         x_lengths = x_lengths[:1]
         spec = spec[:1]
@@ -246,7 +269,7 @@ def evaluate(hps, generator, eval_loader, writer_eval):
         y = y[:1]
         y_lengths = y_lengths[:1]
         break
-      y_hat, attn, mask, *_ = generator.module.infer(x, x_lengths, max_len=1000)
+      y_hat, attn, mask, *_ = generator.infer(x, x_lengths, max_len=1000)
       y_hat_lengths = mask.sum([1,2]).long() * hps.data.hop_length
 
       mel = spec_to_mel_torch(

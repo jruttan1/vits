@@ -15,6 +15,11 @@ from commons import init_weights, get_padding
 
 
 class StochasticDurationPredictor(nn.Module):
+
+  @property
+  def module(self):
+      return self
+
   def __init__(self, in_channels, filter_channels, kernel_size, p_dropout, n_flows=4, gin_channels=0):
     super().__init__()
     filter_channels = in_channels # it needs to be removed from future version.
